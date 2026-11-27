@@ -88,7 +88,7 @@ count(unique(all_gwas2["SNP"])) # all unique
 #FILTER EQTL
 #selection
 eqtl_starnet = eqtl_heart_starnet 
-eqtl_gtex = eqtl_heart_gtex #dokuya göre değiştir.
+eqtl_gtex = eqtl_heart_gtex 
 
 filtered_eqtl_starnet = eqtl_starnet[, c("SNP","convert","p.value")] 
 colnames(filtered_eqtl_starnet) = c("SNP", "GENE", "PVALUE")
@@ -97,9 +97,12 @@ filtered_eqtl_gtex = eqtl_gtex[,c("rs_id_dbSNP151_GRCh38p7","gene_name","pval_no
 colnames(filtered_eqtl_gtex) = c("SNP", "GENE", "PVALUE")
 
 all_eqtl = rbind(filtered_eqtl_gtex, filtered_eqtl_starnet)
-length(unique(all_eqtl$GENE)) #26063 gen
-length(unique(all_eqtl$SNP)) #102480 SNP
+length(unique(all_eqtl$GENE)) 
+length(unique(all_eqtl$SNP)) 
 write.csv(all_eqtl, "all_eqtl_liver.csv")
 
 all_gwas = read.table("all_gwas_10-5.csv", sep = ',', header = TRUE, row.names = 1) 
 all_eqtl = read.table("all_eqtl_blood.csv", sep = ',', header = TRUE, row.names = 1)
+
+#for GEO 
+
