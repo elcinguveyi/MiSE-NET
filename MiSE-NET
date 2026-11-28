@@ -1,1 +1,283 @@
+#prepare p-value weighted dataset 
+selected_rows = pd.read_csv('/content/drive/My Drive/DR-TEZ/dataset/selected_rows_10-5.csv',index_col=0)
+merged_GEO = pd.read_csv('/content/drive/My Drive/DR-TEZ/dataset/batchCorrected_merged_GEO_heart_withLabel.csv',index_col=0)
+
+import pandas as pd
+import numpy as np
+
+np.random.seed(42)
+unique_genes = selected_rows['GENE'].unique()
+unique_snps = selected_rows['SNP'].unique()
+
+available_genes = [gene for gene in unique_genes if gene in merged_GEO.columns]
+
+cartesian_product = pd.DataFrame(
+    [(gene, snp) for gene in available_genes for snp in unique_snps],
+    columns=['GENE', 'SNP']
+)
+
+cartesian_product['GENE_SNP'] = cartesian_product['GENE'] + '_' + cartesian_product['SNP']
+
+selected_rows['LOG_PVALUE'] = -np.log10(selected_rows['PVALUE'])
+
+columns = []  # Yeni sütunları toplamak için bir liste
+
+for index, row in cartesian_product.iterrows():
+    gene = row['GENE']
+    snp = row['SNP']
+    gene_snp = row['GENE_SNP']
+    
+    match = selected_rows[(selected_rows['GENE'] == gene) & (selected_rows['SNP'] == snp)]
+    if not match.empty:
+        log_pvalue = match['LOG_PVALUE'].iloc[0]
+    else:
+        log_pvalue = 1  # Çarpma etkisi olmayan değer
+   
+    columns.append(pd.Series(merged_GEO[gene] * log_pvalue, name=gene_snp))
+
+result_df = pd.concat(columns, axis=1)
+
+result_df['label'] = merged_GEO['label']
+
+# save
+print(result_df)  # 582 sample, son sütun label sütunu
+result_df.to_csv("/content/drive/My Drive/DR-TEZ/dataset/Gen_SNP.csv", index=True) 
+
+################## MiSE-NET ##################
+seed = 17
+os.environ["PYTHONHASHSEED"] = str(seed)
+np.random.seed(seed)
+random.seed(seed)
+tf.random.set_seed(seed)
+
+save_path = "/content/drive/MyDrive/DR-TEZ/dataset/fold_data_train-test"
+
+SAVE_CM_SUMMARY = True
+METRICS = ["accuracy", "precision", "recall", "f1", "roc_auc", "mcc"]
+# output folder
+out_dir = f"{save_path}/MiSE-Net"
+
+def mean_pm_std(x):
+    x = np.asarray(x, dtype=float)
+    return f"{x.mean():.4f} ± {x.std(ddof=1):.4f}"  
+
+# SE BLOCK
+class SEBlock1D(Layer):
+    def __init__(self, channels, ratio=16, **kwargs):
+        super().__init__(**kwargs)
+        self.gap = GlobalAveragePooling1D()
+        self.fc1 = Dense(max(channels // ratio, 1), activation="relu")
+        self.fc2 = Dense(channels, activation="sigmoid")
+        self.reshape = Reshape((1, channels))
+        self.multiply = Multiply()
+
+    def call(self, inputs):
+        se = self.gap(inputs)
+        se = self.fc1(se)
+        se = self.fc2(se)
+        se = self.reshape(se)
+        return self.multiply([inputs, se])
+
+
+# ======================================
+# 2) EXPERT + MoE
+# ======================================
+class Expert(Layer):
+    def __init__(self, units, ratio=16, **kwargs):
+        super().__init__(**kwargs)
+        self.dense = Dense(units, activation="relu")
+        self.se = SEBlock1D(units, ratio=ratio)
+
+    def call(self, inputs):
+        x = self.dense(inputs)
+        x = tf.expand_dims(x, axis=1)
+        x = self.se(x)
+        return tf.squeeze(x, axis=1)
+
+
+class MoE(Layer):
+    def __init__(self, num_experts=4, units=128, ratio=16, **kwargs):
+        super().__init__(**kwargs)
+        self.experts = [Expert(units, ratio=ratio) for _ in range(num_experts)]
+        self.gate = Dense(num_experts, activation="softmax")
+
+    def call(self, inputs):
+        gates = self.gate(inputs)
+        expert_outs = [expert(inputs) for expert in self.experts]
+        expert_outs = tf.stack(expert_outs, axis=1)
+        gates = tf.expand_dims(gates, axis=-1)
+        return tf.reduce_sum(expert_outs * gates, axis=1)
+
+
+# ======================================
+# 3) MODEL FACTORY
+# ======================================
+def create_model(input_dim):
+    inputs = Input(shape=(input_dim, 1))
+
+    x = Conv1D(64, 7, activation="relu", padding="same")(inputs)
+    x = MaxPooling1D(2)(x)
+    x = SEBlock1D(64)(x)
+
+    x = Conv1D(64, 5, activation="relu", padding="same")(x)
+    x = MaxPooling1D(2)(x)
+    x = SEBlock1D(64)(x)
+
+    x = Flatten()(x)
+    x = MoE(num_experts=4, units=128, ratio=16)(x)
+
+    x = Dense(256, activation="relu")(x)
+    outputs = Dense(1, activation="sigmoid")(x)
+
+    model = Model(inputs, outputs)
+    model.compile(
+        optimizer="adam",
+        loss="binary_crossentropy",
+        metrics=["accuracy"]
+    )
+    return model
+
+
+# ======================================
+# 4) PATHS + GLOBAL STORAGE
+# ======================================
+save_path = "/content/drive/MyDrive/DR-TEZ/dataset/fold_data_train-test"
+feature_names = np.load(f"{save_path}/feature_names.npy")
+
+all_rows = []
+cm_rows = []
+#feature_fold_counter = defaultdict(int)
+fold_importance_tables = []
+
+
+# ======================================
+# 5) 5-FOLD LOOP
+# ======================================
+for fold in range(1, 6):
+
+    print("\n" + "="*60)
+    print(f"🔵 FOLD {fold}")
+    print("="*60)
+
+    # ---- Load data ----
+    X_train = np.load(f"{save_path}/fold{fold}_X_train.npy")
+    X_test  = np.load(f"{save_path}/fold{fold}_X_test.npy")
+    y_train = np.load(f"{save_path}/fold{fold}_y_train.npy")
+    y_test  = np.load(f"{save_path}/fold{fold}_y_test.npy")
+
+    # ---- Normalize ----
+    scaler = StandardScaler()
+    X_train = scaler.fit_transform(X_train)
+    X_test  = scaler.transform(X_test)
+
+    X_train = np.expand_dims(X_train, -1)
+    X_test  = np.expand_dims(X_test, -1)
+
+    # ---- Model ----
+    model = create_model(X_train.shape[1])
+
+    cw_vals = class_weight.compute_class_weight(
+        "balanced", classes=np.unique(y_train), y=y_train
+    )
+    class_weights = dict(enumerate(cw_vals))
+
+    ckpt = f"/content/best_moe_fold{fold}.h5"
+    callbacks = [
+        ModelCheckpoint(ckpt, monitor="val_accuracy",save_best_only=True, mode="max", verbose=0),
+        EarlyStopping(monitor="val_accuracy", patience=10, restore_best_weights=True)
+    ]
+
+    # ---- Train ----
+    model.fit(
+        X_train, y_train,
+        epochs=30,
+        batch_size=16,
+        #validation_split=0.15,
+        class_weight=class_weights,
+        callbacks=callbacks,
+        verbose=1
+    )
+
+    model.load_weights(ckpt)
+
+    # ---- Test ----
+    y_prob = model.predict(X_test).ravel()
+    y_pred = (y_prob > 0.5).astype(int)
+
+    acc  = accuracy_score(y_test, y_pred)
+    prec = precision_score(y_test, y_pred)
+    rec  = recall_score(y_test, y_pred)
+    f1   = f1_score(y_test, y_pred)
+    auc  = roc_auc_score(y_test, y_prob)
+    mcc  = matthews_corrcoef(y_test, y_pred)
+
+
+    all_rows.append({
+        "fold": fold,
+        "accuracy": acc,
+        "precision": prec,
+        "recall": rec,
+        "f1": f1,
+        "roc_auc": auc,
+        "mcc": mcc
+    })
+
+    cm = confusion_matrix(y_test, y_pred)
+    cm_rows.append({
+        "fold": fold,
+        "tn": int(cm[0, 0]),
+        "fp": int(cm[0, 1]),
+        "fn": int(cm[1, 0]),
+        "tp": int(cm[1, 1])
+    })
+
+
+# ======================================
+# 3) METRICS TABLES
+# ======================================
+df = pd.DataFrame(all_rows)
+df_cm = pd.DataFrame(cm_rows)
+
+print("\n✅ Finished runs. Detail rows:", len(df))
+
+# Fold başına tek değer var; direkt Fold-1..5 görünsün
+df_display = df.copy()
+df_display["fold"] = df_display["fold"].apply(lambda x: f"Fold-{x}")
+df_display = df_display.set_index("fold").round(6)
+
+# Overall: 5 fold mean ± std
+overall_row = {m: mean_pm_std(df[m].values) for m in METRICS}
+final_table = pd.concat(
+    [df_display.astype(str), pd.DataFrame([overall_row], index=["Overall"])],
+    axis=0
+)
+
+print("\n📊 only 5-fold — fold değerleri + Overall(mean ± std)")
+print(final_table)
+
+
+summary_csv = f"{out_dir}/only_5fold_summary_meanpmstd.csv"
+final_table.to_csv(summary_csv)
+
+
+# ======================================
+# 5) CONFUSION MATRIX SAVE
+# ======================================
+if SAVE_CM_SUMMARY:
+
+    cm_overall = {k: mean_pm_std(df_cm[k].values) for k in ["tn", "fp", "fn", "tp"]}
+    cm_final = pd.concat(
+        [df_cm.set_index(df_cm["fold"].apply(lambda x: f"Fold-{x}")).drop(columns=["fold"]).astype(int).astype(str),
+         pd.DataFrame([cm_overall], index=["Overall"])],
+        axis=0
+    )
+
+    cm_summary_csv = f"{out_dir}/only_5fold_cm_summary_meanpmstd.csv"
+    cm_final.to_csv(cm_summary_csv)
+
+    print("\n📌 CM (Fold values) + Overall(mean ± std)")
+    print(cm_final)
+
+
+
 
